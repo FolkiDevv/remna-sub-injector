@@ -30,6 +30,20 @@
 
 ### Вариант 1 — Docker Compose (рекомендуется)
 
+Образ публикуется в GitHub Container Registry и собирается сразу под
+`linux/amd64` и `linux/arm64`:
+
+```
+ghcr.io/folkidevv/remna-sub-injector:latest
+```
+
+Теги соответствуют версии релиза: `latest`, `1.2.3`, `1.2`, `1`.
+
+Контейнер работает от непривилегированного пользователя (UID/GID `10001`) и
+ничего не пишет на диск, поэтому может запускаться в режиме read-only.
+Убедитесь, что `config.toml` и файлы в `data/` доступны этому UID на чтение —
+обычных прав `644` достаточно.
+
 **Шаг 1.** Склонируйте репозиторий:
 
 ```bash
@@ -37,22 +51,7 @@ git clone https://github.com/itwormz/remna-sub-injector /opt/remna-sub-injector
 cd /opt/remna-sub-injector
 ```
 
-**Шаг 2.** Скачайте бинарник в папку `bin/`:
-
-```bash
-mkdir -p bin
-ARCH=$(uname -m)
-case $ARCH in
-  x86_64)  BINARY="sub-injector-linux-x86_64" ;;
-  aarch64) BINARY="sub-injector-linux-aarch64" ;;
-  *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
-esac
-curl -L https://github.com/itwormz/remna-sub-injector/releases/latest/download/${BINARY} \
-  -o bin/sub-injector
-chmod +x bin/sub-injector
-```
-
-**Шаг 3.** Создайте конфиг:
+**Шаг 2.** Создайте конфиг:
 
 ```bash
 cp config.toml.example config.toml
@@ -60,7 +59,7 @@ cp config.toml.example config.toml
 
 Отредактируйте `config.toml` под свои настройки перед запуском.
 
-**Шаг 4.** Подготовьте источник дополнительных ссылок.
+**Шаг 3.** Подготовьте источник дополнительных ссылок.
 
 В каждом правиле `config.toml` есть поле `links_source` — инжектор читает из него прокси URI и добавляет их в каждый подходящий ответ подписки. Доступно два варианта:
 
@@ -73,13 +72,13 @@ cp config.toml.example config.toml
 
 Подробности — в разделе [Формат источника ссылок](#формат-источника-ссылок).
 
-**Шаг 5.** Создайте `docker-compose.yml`:
+**Шаг 4.** Создайте `docker-compose.yml`:
 
 ```bash
 cp docker-compose.yml.example docker-compose.yml
 ```
 
-**Шаг 6.** Запустите:
+**Шаг 5.** Запустите:
 
 ```bash
 docker compose up -d
@@ -232,3 +231,15 @@ cross build --release --target aarch64-unknown-linux-musl
 ```
 
 Результат: `target/aarch64-unknown-linux-musl/release/sub-injector`
+
+### Docker-образ
+
+`Dockerfile` многоэтапный — он сам компилирует бинарник, заранее собранный
+артефакт не нужен:
+
+```bash
+docker build -t sub-injector .
+```
+
+На выходе — образ на базе `scratch`, содержащий только статически слинкованный
+бинарник (несколько мегабайт).

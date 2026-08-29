@@ -1,9 +1,19 @@
 services:
   sub-injector:
-    build: .
+    image: ghcr.io/folkidevv/remna-sub-injector:latest
+    # To build the image from this checkout instead of pulling it,
+    # comment out `image:` above and uncomment the line below:
+    # build: .
     restart: unless-stopped
     ports:
       - "3020:3020"
     volumes:
-      - ./config.toml:/app/config.toml
-      - ./data:/data
+      - ./config.toml:/app/config.toml:ro
+      - ./data:/data:ro
+    # The container runs as UID 10001 and never writes to disk,
+    # so it can be fully locked down.
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true

@@ -1,0 +1,23 @@
+# Build output and downloaded binaries
+target/
+bin/
+
+# Runtime data and local config
+data/
+config.toml
+docker-compose.yml
+.env
+.env.*
+
+# VCS, CI and docs — irrelevant to the build, and changing them would
+# needlessly invalidate the build cache
+.git/
+.gitignore
+.github/
+*.md
+LICENSE
+
+# IDE
+.idea/
+.vscode/
+*.iml

@@ -30,6 +30,20 @@ This allows injecting additional links (e.g. your own Hysteria2 or VLESS nodes) 
 
 ### Option 1 — Docker Compose (recommended)
 
+The image is published to the GitHub Container Registry and built for both
+`linux/amd64` and `linux/arm64`:
+
+```
+ghcr.io/folkidevv/remna-sub-injector:latest
+```
+
+Tags follow the release version: `latest`, `1.2.3`, `1.2`, `1`.
+
+The container runs as an unprivileged user (UID/GID `10001`) and never writes to
+disk, so it can run fully read-only. Make sure `config.toml` and the files under
+`data/` are readable by that UID on the host — the usual `644` permissions are
+fine.
+
 **Step 1.** Clone the repository:
 
 ```bash
@@ -37,22 +51,7 @@ git clone https://github.com/itwormz/remna-sub-injector /opt/remna-sub-injector
 cd /opt/remna-sub-injector
 ```
 
-**Step 2.** Download the binary into the `bin/` folder:
-
-```bash
-mkdir -p bin
-ARCH=$(uname -m)
-case $ARCH in
-  x86_64)  BINARY="sub-injector-linux-x86_64" ;;
-  aarch64) BINARY="sub-injector-linux-aarch64" ;;
-  *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
-esac
-curl -L https://github.com/itwormz/remna-sub-injector/releases/latest/download/${BINARY} \
-  -o bin/sub-injector
-chmod +x bin/sub-injector
-```
-
-**Step 3.** Create the config:
+**Step 2.** Create the config:
 
 ```bash
 cp config.toml.example config.toml
@@ -60,7 +59,7 @@ cp config.toml.example config.toml
 
 Edit `config.toml` before starting.
 
-**Step 4.** Prepare your extra links.
+**Step 3.** Prepare your extra links.
 
 Each injection rule in `config.toml` has a `links_source` field — the injector will read proxy URIs from it and append them to every matching subscription response. You have two options:
 
@@ -73,13 +72,13 @@ Each injection rule in `config.toml` has a `links_source` field — the injector
 
 See [Links source format](#links-source-format) for details.
 
-**Step 5.** Create `docker-compose.yml`:
+**Step 4.** Create `docker-compose.yml`:
 
 ```bash
 cp docker-compose.yml.example docker-compose.yml
 ```
 
-**Step 6.** Start:
+**Step 5.** Start:
 
 ```bash
 docker compose up -d
@@ -232,3 +231,15 @@ cross build --release --target aarch64-unknown-linux-musl
 ```
 
 Output: `target/aarch64-unknown-linux-musl/release/sub-injector`
+
+### Docker image
+
+The `Dockerfile` is multi-stage — it compiles the binary itself, so no
+pre-built artifact is needed:
+
+```bash
+docker build -t sub-injector .
+```
+
+The result is a `scratch`-based image containing only the statically linked
+binary (a few megabytes).
