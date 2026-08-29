@@ -10,6 +10,7 @@ When a VPN client fetches a subscription list, the injector:
 2. Checks the request headers (e.g. `User-Agent`) against configured rules
 3. If a rule matches and the response is a base64-encoded subscription list — decodes it, appends the configured extra links, and re-encodes it before sending back to the client
 4. If no rule matches, or the response is a YAML/JSON config — passes it through untouched
+5. If the response is a service message rather than a working subscription — passes it through untouched
 
 This allows injecting additional links (e.g. your own Hysteria2 or VLESS nodes) into subscription lists without modifying the upstream server, and doing so selectively per client app.
 
@@ -20,6 +21,36 @@ This allows injecting additional links (e.g. your own Hysteria2 or VLESS nodes) 
 - YAML and JSON content types are never modified (Clash/Sing-Box config files)
 - Injection rules are evaluated in order; the first matching rule wins
 - If the links source is unreachable or empty, the response is passed through unchanged
+
+## Service messages
+
+When a user is deactivated, their subscription has expired, or they have used up their
+traffic, Remnawave still answers with a base64 list — but one made of placeholder entries
+carrying the status as their remark. Appending extra links to such a response would hand a
+blocked user working nodes, so the injector detects these responses and proxies them
+untouched.
+
+Detection uses two signals that Remnawave generates itself, so nothing needs configuring
+and no panel setting can silently disable them:
+
+- **Placeholder endpoints** — every entry in the body points at a non-routable host
+  (`0.0.0.0`, `127.0.0.1`, `::`, `::1`, `localhost`). This is the only signal that catches a
+  deactivated user whose expiry date and traffic budget are still fine.
+- **The `subscription-userinfo` response header** — `expire` is non-zero and in the past, or
+  `total` is non-zero and `upload + download` has reached it. (`expire = 0` means "never
+  expires" and `total = 0` means "unlimited traffic"; neither counts as a service state.)
+
+The skip is deliberately conservative: an entry whose host cannot be read — a `vmess://`
+link, for instance, which hides its endpoint inside a base64 payload — counts as a real
+node, so an unusual body is still injected rather than silently skipped.
+
+The reason for each skip is written to the log, without the header value itself:
+
+```
+[sub-injector] skipping injection: service message (service hosts)
+[sub-injector] skipping injection: service message (userinfo: expired)
+[sub-injector] skipping injection: service message (userinfo: traffic limit)
+```
 
 ## Security notes
 
