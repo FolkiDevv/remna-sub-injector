@@ -20,7 +20,12 @@ This allows injecting additional links (e.g. your own Hysteria2 or VLESS nodes) 
 - The injector base64-decodes the body, appends the extra links, and re-encodes
 - YAML and JSON content types are never modified (Clash/Sing-Box config files)
 - Injection rules are evaluated in order; the first matching rule wins
-- If the links source is unreachable or empty, the response is passed through unchanged
+- A rule may take its links from several sources at once, merged in the order they are listed;
+  a link that appears in more than one source is injected once
+- Each source is cached, so a client refreshing its subscription does not cause a fetch of every
+  source (see [Caching](#caching))
+- If every source of the matching rule is unreachable or empty, the response is passed through
+  unchanged
 
 ## Service messages
 
@@ -56,6 +61,7 @@ The reason for each skip is written to the log, without the header value itself:
 
 - **Close the port from the public internet.** The injector has no built-in authentication — security relies entirely on the subscription token in the URL being secret. Make sure port 3020 is not reachable from the outside (firewall rule or a private Docker network).
 - **No TLS on the injector itself.** Traffic between the client and the injector is plain HTTP, so tokens and links are transmitted in cleartext. Place a reverse proxy (nginx, Caddy, etc.) with a TLS certificate in front of the injector when clients connect over the internet.
+- **A links source can be a secret.** When a source is another panel's subscription link, its path *is* the credential guarding it. The injector never writes that path to the log — a remote source appears there as its scheme and host only (`https://panel.example.com/...`), the same way incoming request paths are already truncated. Local file paths are logged whole; they are not secrets.
 
 ## Installation
 
@@ -92,14 +98,16 @@ Edit `config.toml` before starting.
 
 **Step 3.** Prepare your extra links.
 
-Each injection rule in `config.toml` has a `links_source` field — the injector will read proxy URIs from it and append them to every matching subscription response. You have two options:
+Each injection rule in `config.toml` has a `links_source` field — the injector reads proxy URIs from it and appends them to every matching subscription response. It takes one source or a list of them:
 
 - **Local file** — create the file and put one proxy URI per line:
   ```bash
   mkdir -p data
   nano data/hysteria2-links.txt
   ```
-- **Remote URL** — point `links_source` directly to an `https://` URL that returns the same one-URI-per-line format.
+- **Remote URL** — an `https://` URL returning the same one-URI-per-line format.
+- **Another subscription** — an `https://` subscription link. Those serve a base64 list; the
+  injector detects that and decodes it, so nodes from another panel can be merged in as they are.
 
 See [Links source format](#links-source-format) for details.
 
@@ -194,6 +202,9 @@ The injector reads a TOML config file. By default it looks for `config.toml` in 
 |---|---|---|---|---|
 | `upstream_url` | string | yes | — | Base URL of the upstream subscription server |
 | `bind_addr` | string | no | `0.0.0.0:3020` | Address and port to listen on |
+| `cache_ttl` | integer | no | `300` | Seconds a links source may be reused when it does not announce an interval of its own |
+| `cache_max_stale` | integer | no | `3600` | Seconds a source may keep serving its last good answer after a failed refresh |
+| `cache_respect_headers` | bool | no | `true` | `false` ignores what a source announces and always uses `cache_ttl` |
 | `injections` | array | yes | — | List of injection rules (see below) |
 
 Each `[[injections]]` rule:
@@ -202,7 +213,7 @@ Each `[[injections]]` rule:
 |---|---|---|
 | `header` | string | Request header name to match against (case-insensitive) |
 | `contains` | array of strings | List of substrings — rule matches if the header value contains **any** of them (case-insensitive) |
-| `links_source` | string | Local file path **or** `http(s)://` URL to fetch extra links from |
+| `links_source` | string **or** array of strings | Where the extra links come from: a local file path, an `http(s)://` URL, or an `http(s)://` subscription link. Several sources are merged in the order given |
 
 ### Example config
 
@@ -220,16 +231,20 @@ header = "User-Agent"
 contains = ["clash.meta", "mihomo"]
 links_source = "/data/clash-links.txt"
 
-# Remote URL is also supported:
+# Several sources on one rule:
 # [[injections]]
 # header = "User-Agent"
 # contains = ["hiddify"]
-# links_source = "https://example.com/my-extra-links.txt"
+# links_source = [
+#   "/data/hysteria2-links.txt",
+#   "https://example.com/my-extra-links.txt",
+#   "https://another-panel.example.com/sub/YOUR-TOKEN",
+# ]
 ```
 
 ## Links source format
 
-Each links source (file or URL) must contain one proxy URI per line:
+A links source contains one proxy URI per line:
 
 ```
 hysteria2://password@1.2.3.4:443?obfs=salamander&obfs-password=secret#My-Node-1
@@ -238,6 +253,62 @@ ss://base64encodedinfo@9.10.11.12:8388#My-Node-3
 ```
 
 Blank lines and leading/trailing whitespace are stripped automatically.
+
+A source may also be a whole **base64 subscription** — the format Remnawave, Marzban and the
+others serve. That shape is detected, not configured: if the payload has no readable URI in it,
+it is decoded as base64 and read again. So a subscription link from another panel can be listed
+as a source directly, and its nodes are merged into the response.
+
+### Validation
+
+Everything a source returns is checked to be a list of proxy URIs (`scheme://…`) before any of it
+reaches a client, which keeps an HTML error page, a captive portal or a truncated body out of the
+subscription. What happens to a source that is only partly readable depends on where it came from:
+
+- **A local file** is hand-written, so an unreadable line is treated as a typo: that line is
+  dropped, a warning naming the count goes to the log, and the remaining nodes are injected.
+- **A remote source** is machine-generated, so a line that is not a proxy URI means the response
+  is corrupt rather than mistyped — the whole source is rejected and its cached links are used
+  instead (see [Caching](#caching)).
+
+A source whose own subscription is expired, disabled or out of traffic is rejected too: its body
+is placeholder entries on `0.0.0.0`, detected exactly as described under
+[Service messages](#service-messages), and injecting those would hand clients dead nodes.
+
+## Caching
+
+Without caching every client refresh would re-read every source — a file read and a full HTTP
+fetch of somebody else's subscription per request. Each source is refreshed on its own schedule
+instead.
+
+**Local files** are not on a timer at all. They are revalidated by modification time and size,
+which is cheap, so editing a links file takes effect on the very next request.
+
+**Remote sources** are refreshed on an interval taken from the first of these that applies:
+
+1. **`profile-update-interval`** — the response header from the
+   [XTLS subscription standard](https://github.com/XTLS/Xray-core/discussions/4877), in **hours**.
+   This is the signal VPN clients themselves follow, and Remnawave sends it (its
+   `SUB_UPDATE_INTERVAL`, 12 hours by default), as do Marzban, Marzneshin and Hiddify Manager.
+2. **`Cache-Control: max-age` / `s-maxage`** — not part of the subscription standard, but it is
+   what nginx or a CDN sends when a plain-text list is served as a static file. `no-cache` and
+   `no-store` are read as "as often as allowed" rather than "every request".
+3. **`cache_ttl`** from the config, 300 seconds by default.
+
+The result is clamped to between 30 seconds and 24 hours, so neither an over-eager source nor a
+stray `profile-update-interval: 8760` can take over. Set `cache_respect_headers = false` to skip
+steps 1 and 2 and always use `cache_ttl`. If a source sends an `ETag` or `Last-Modified`, the
+refresh is conditional and a `304` just restarts the interval.
+
+`Expires` is not supported — the subscription standard does not use it, and parsing HTTP dates
+would mean another dependency.
+
+When a refresh fails — the source is down, answers non-2xx, or returns something that does not
+validate — its last good answer keeps being served for `cache_max_stale` (an hour by default) past
+the refresh interval. Beyond that the links are too old to stand behind and the source is dropped
+from the response. Either way the other sources of the rule are unaffected, and the log says which
+source went stale. This matters because the alternative is silent: before caching, a source being
+down meant the client simply got a subscription without your extra nodes.
 
 ## Building from source
 
