@@ -1,9 +1,22 @@
 upstream_url = "http://upstream:2096"
 bind_addr = "0.0.0.0:3020"
 
+# How long a links source may be reused before it is read again.
+# A source can announce its own interval — Remnawave and other panels send
+# `profile-update-interval` (in hours) — and that always wins; cache_ttl is the
+# fallback for sources that announce nothing. Seconds.
+cache_ttl = 300
+# If a source cannot be read, its last good answer keeps being used for this long
+# past its refresh interval, so an outage does not silently drop your extra nodes.
+cache_max_stale = 3600
+# Set to false to ignore what a source announces and always use cache_ttl.
+cache_respect_headers = true
+
 # Each [[injections]] block defines one rule.
 # The proxy checks request headers against each rule in order — first match wins.
-# links_source can be a local file path OR an http(s):// URL.
+# links_source is one source or a list of them, merged in the order given.
+# A source can be a local file path, an http(s):// URL serving one URI per line,
+# or an http(s):// subscription link (base64 — it is decoded automatically).
 
 [[injections]]
 header = "User-Agent"
@@ -15,8 +28,12 @@ header = "User-Agent"
 contains = ["clash.meta", "mihomo"]
 links_source = "/data/clash-links.txt"
 
-# Example with a remote URL as source:
+# Example with several sources on one rule:
 # [[injections]]
 # header = "User-Agent"
 # contains = ["hiddify"]
-# links_source = "https://example.com/my-extra-links.txt"
+# links_source = [
+#   "/data/hysteria2-links.txt",
+#   "https://example.com/my-extra-links.txt",
+#   "https://another-panel.example.com/sub/YOUR-TOKEN",
+# ]

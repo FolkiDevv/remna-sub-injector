@@ -4,6 +4,10 @@ version = "0.1.1"
 edition = "2021"
 license = "MIT"
 
+[lib]
+name = "sub_injector"
+path = "src/lib.rs"
+
 [[bin]]
 name = "sub-injector"
 path = "src/main.rs"
