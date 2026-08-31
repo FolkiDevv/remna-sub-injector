@@ -37,6 +37,18 @@ pub fn leak(s: String) -> &'static str {
     Box::leak(s.into_boxed_str())
 }
 
+pub fn leak_bytes(bytes: Vec<u8>) -> &'static [u8] {
+    Box::leak(bytes.into_boxed_slice())
+}
+
+/// The bytes of `text` as an upstream serving `content-encoding: gzip` would send them.
+pub fn gzip(text: &str) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(text.as_bytes()).unwrap();
+    encoder.finish().unwrap()
+}
+
 pub fn decode_b64(s: &str) -> String {
     let stripped: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
     STANDARD
@@ -108,6 +120,68 @@ pub async fn start_mock_with_headers(
                     builder = builder.header(*name, *value);
                 }
                 builder.body(axum::body::Body::from(body)).unwrap()
+            }),
+        );
+        axum::serve(listener, app).await.unwrap();
+    });
+    settle().await;
+    format!("http://127.0.0.1:{}", port)
+}
+
+/// A mock upstream whose body is raw bytes rather than text — for a compressed response.
+pub async fn start_mock_bytes(
+    body: &'static [u8],
+    content_type: &'static str,
+    extra: &'static [(&'static str, &'static str)],
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let app = Router::new().route(
+            "/{*path}",
+            get(move || async move {
+                let mut builder = Response::builder().header("content-type", content_type);
+                for (name, value) in extra {
+                    builder = builder.header(*name, *value);
+                }
+                builder.body(axum::body::Body::from(body)).unwrap()
+            }),
+        );
+        axum::serve(listener, app).await.unwrap();
+    });
+    settle().await;
+    format!("http://127.0.0.1:{}", port)
+}
+
+/// An upstream that negotiates like a real panel behind nginx: it compresses with whatever the
+/// request said it accepts. `zstd` first, because that is what a modern client asks for and what
+/// this injector's reqwest is not built to decode.
+pub async fn start_negotiating_upstream(body: &'static str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let app = Router::new().route(
+            "/{*path}",
+            get(move |headers: HeaderMap| async move {
+                let accepts = headers
+                    .get("accept-encoding")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let (encoding, encoded) = if accepts.contains("zstd") {
+                    // Not real zstd, and it does not need to be: what matters is that the body
+                    // reaches the injector still encoded.
+                    ("zstd", b"\x28\xb5\x2f\xfd-not-decodable".to_vec())
+                } else if accepts.contains("gzip") {
+                    ("gzip", gzip(body))
+                } else {
+                    ("identity", body.as_bytes().to_vec())
+                };
+                Response::builder()
+                    .header("content-type", "text/plain")
+                    .header("content-encoding", encoding)
+                    .body(axum::body::Body::from(encoded))
+                    .unwrap()
             }),
         );
         axum::serve(listener, app).await.unwrap();

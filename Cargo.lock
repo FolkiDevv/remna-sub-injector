@@ -1058,6 +1058,7 @@ version = "0.1.1"
 dependencies = [
  "axum",
  "base64",
+ "flate2",
  "reqwest",
  "serde",
  "tokio",

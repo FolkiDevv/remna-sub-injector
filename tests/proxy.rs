@@ -207,6 +207,66 @@ async fn hop_by_hop_headers_stripped() {
     assert!(headers.get("x-custom").is_some(), "x-custom must be preserved");
 }
 
+/// A panel behind nginx usually answers a client that says `accept-encoding: gzip` with a
+/// compressed body. Forwarding that header made reqwest hand the injector the still-compressed
+/// bytes, and injection silently did nothing.
+#[tokio::test]
+async fn a_compressed_upstream_response_is_still_injected() {
+    let upstream = start_mock_bytes(
+        leak_bytes(gzip(&fake_b64())),
+        "text/plain",
+        &[("content-encoding", "gzip")],
+    )
+    .await;
+    let links_file = write_temp_file(EXTRA_LINKS);
+    let cfg = make_cfg(upstream, hy2_rules(&[&links_file]));
+
+    let req = Request::builder()
+        .uri("/sub/TOKEN")
+        .header("user-agent", "Happ/2.0")
+        .header("accept-encoding", "gzip, deflate, br")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = {
+        use tower::ServiceExt;
+        build_app(cfg).oneshot(req).await.unwrap()
+    };
+    let headers = resp.headers().clone();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let decoded = decode_b64(&String::from_utf8_lossy(&body));
+
+    assert!(decoded.contains("hysteria2://"), "the extra links must reach a client behind gzip");
+    assert!(decoded.contains("vless://aaaaa"), "the original links must survive");
+    assert!(
+        headers.get("content-encoding").is_none(),
+        "the body handed back is decoded, so it must not claim to be gzip"
+    );
+}
+
+/// A client asking for a compression this injector cannot decode used to get no injection at
+/// all: `accept-encoding` was forwarded verbatim, the panel answered in that compression, and the
+/// body reached `decode_sub_body` still encoded — where it simply reads as "not a subscription".
+/// reqwest advertises what it can actually decode, so it must be the one to set that header.
+#[tokio::test]
+async fn a_client_asking_for_an_unsupported_compression_still_gets_injection() {
+    let upstream = start_negotiating_upstream(leak(fake_b64())).await;
+    let links_file = write_temp_file(EXTRA_LINKS);
+    let cfg = make_cfg(upstream, hy2_rules(&[&links_file]));
+
+    let req = Request::builder()
+        .uri("/sub/TOKEN")
+        .header("user-agent", "Happ/2.0")
+        .header("accept-encoding", "gzip, deflate, br, zstd")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let (status, body) = call_request(build_app(cfg), req).await;
+    let decoded = decode_b64(&body);
+
+    assert_eq!(status, 200);
+    assert!(decoded.contains("hysteria2://"), "the extra links must reach the client");
+    assert!(decoded.contains("vless://aaaaa"), "the original links must survive");
+}
+
 #[tokio::test]
 async fn different_ua_gets_different_links() {
     let upstream = start_mock(leak(fake_b64()), "text/plain").await;
