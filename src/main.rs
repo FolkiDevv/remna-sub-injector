@@ -4,6 +4,7 @@ use sub_injector::{
     build_app,
     cache::LinksCache,
     config::load_config,
+    source_headers::SourceHeaders,
     AppState,
 };
 use tokio::net::TcpListener;
@@ -19,11 +20,16 @@ async fn main() {
         .build()
         .expect("Failed to build HTTP client");
 
+    // A source is usually another panel, and a panel answers by who is asking — so the injector
+    // asks as one steady Happ client. The hwid is derived from the upstream URL, which keeps it
+    // the same across restarts instead of claiming a new device on every one.
+    let source_headers = SourceHeaders::from_config(&file_cfg.upstream_url, &file_cfg.source_headers);
     let links_cache = LinksCache::new(
         file_cfg.cache_ttl(),
         file_cfg.cache_max_stale(),
         file_cfg.cache_respect_headers,
-    );
+    )
+    .with_source_headers(source_headers.clone());
 
     let cfg = Arc::new(AppState {
         upstream: file_cfg.upstream_url,
@@ -39,6 +45,10 @@ async fn main() {
         .await
         .expect("Failed to bind");
 
+    if !source_headers.is_empty() {
+        // Names only: x-hwid is what identifies this deployment to a source.
+        println!("link sources are fetched with: {}", source_headers.names().join(", "));
+    }
     println!("sub-injector v{} listening on {bind_addr}", env!("CARGO_PKG_VERSION"));
     axum::serve(listener, app).await.unwrap();
 }

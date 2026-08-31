@@ -205,6 +205,7 @@ The injector reads a TOML config file. By default it looks for `config.toml` in 
 | `cache_ttl` | integer | no | `300` | Seconds a links source may be reused when it does not announce an interval of its own |
 | `cache_max_stale` | integer | no | `3600` | Seconds a source may keep serving its last good answer after a failed refresh |
 | `cache_respect_headers` | bool | no | `true` | `false` ignores what a source announces and always uses `cache_ttl` |
+| `source_headers` | table | no | Happ defaults | Headers the injector sends when it fetches a links source over HTTP (see [Fetching a links source](#fetching-a-links-source)) |
 | `injections` | array | yes | — | List of injection rules (see below) |
 
 Each `[[injections]]` rule:
@@ -309,6 +310,49 @@ the refresh interval. Beyond that the links are too old to stand behind and the 
 from the response. Either way the other sources of the rule are unaffected, and the log says which
 source went stale. This matters because the alternative is silent: before caching, a source being
 down meant the client simply got a subscription without your extra nodes.
+
+## Fetching a links source
+
+A links source that is an `http(s)://` URL is usually another subscription panel, and a panel
+answers by who is asking: it picks the payload format from the `User-Agent`, and with a
+[HWID device limit](https://docs.rw/docs/features/hwid-device-limit/) enabled it wants `x-hwid`
+before it hands out a subscription at all. So the injector fetches a source as a Happ client
+would:
+
+| Header | Default |
+|---|---|
+| `user-agent` | `Happ/2.0.0 (com.happproxy; iOS 18.3.0)` |
+| `accept` | `*/*` |
+| `x-hwid` | derived from `upstream_url`, in the shape of a UUID |
+| `x-device-os` | `iOS` |
+| `x-ver-os` | `18.3` |
+| `x-device-model` | `iPhone` |
+
+These are the **injector's** headers, not the client's. Nothing from the request that triggered
+the fetch is forwarded to a source — not its `User-Agent`, not its `x-hwid`, and not its cookies
+— so a source sees one steady device and its answer can be cached for everyone instead of being
+shaped by whichever client arrived first.
+
+The `x-hwid` is derived from `upstream_url` rather than generated, so it stays the same across
+restarts and upgrades: a source with a device limit counts this injector as one device, not a new
+one after every deploy.
+
+Override any of it with a `[source_headers]` table — for example to paste the exact `User-Agent`
+of your own Happ build, or your own device id. An empty value drops the header entirely:
+
+```toml
+[source_headers]
+user-agent = "Happ/2.5.0 (com.happproxy; iOS 18.3.0)"
+x-device-model = ""
+```
+
+Being a plain TOML table, `[source_headers]` has to come **before** the first `[[injections]]`
+block, otherwise TOML nests it inside that rule. Headers the injector manages itself are rejected
+at startup: `if-none-match` and `if-modified-since` (the cache's own validators), `accept-encoding`
+(setting it by hand turns off automatic decompression), `host`, `content-length`, and the
+hop-by-hop headers.
+
+Local file sources are read from disk, so none of this applies to them.
 
 ## Building from source
 

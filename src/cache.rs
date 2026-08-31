@@ -15,6 +15,7 @@ use crate::{
     links::{
         parse_links_payload, source_kind, source_label, LinksError, SourceKind, TtlPolicy,
     },
+    source_headers::SourceHeaders,
     MAX_BODY_SIZE,
 };
 
@@ -62,6 +63,9 @@ pub struct LinksCache {
     slots: Mutex<HashMap<String, Slot>>,
     ttl_policy: TtlPolicy,
     max_stale: Duration,
+    /// Put on every fetch of a URL source. The same set for every client, which is what keeps a
+    /// slot keyed on the source URL alone honest.
+    source_headers: SourceHeaders,
 }
 
 impl LinksCache {
@@ -70,7 +74,19 @@ impl LinksCache {
     }
 
     pub fn with_policy(ttl_policy: TtlPolicy, max_stale: Duration) -> Self {
-        Self { slots: Mutex::new(HashMap::new()), ttl_policy, max_stale }
+        Self {
+            slots: Mutex::new(HashMap::new()),
+            ttl_policy,
+            max_stale,
+            source_headers: SourceHeaders::default(),
+        }
+    }
+
+    /// The headers URL sources are fetched with. Without this a source is fetched bare, which is
+    /// how the cache behaves in tests that do not care.
+    pub fn with_source_headers(mut self, source_headers: SourceHeaders) -> Self {
+        self.source_headers = source_headers;
+        self
     }
 
     /// Every link a rule contributes, in the order its sources are configured, without
@@ -179,7 +195,9 @@ impl LinksCache {
             }
         }
 
-        let mut request = client.get(source);
+        // The injector's own headers first, so the cache's validators below can never be
+        // displaced by whatever the config asks for.
+        let mut request = self.source_headers.apply(client.get(source));
         if let Some(Entry { validator: Validator::Http { etag, last_modified }, .. }) = entry.as_ref() {
             if let Some(etag) = etag {
                 request = request.header("if-none-match", etag);

@@ -5,6 +5,7 @@ pub mod cache;
 pub mod config;
 pub mod links;
 pub mod proxy;
+pub mod source_headers;
 pub mod subscription;
 
 /// Neither an upstream response nor a links source may be larger than this.

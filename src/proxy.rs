@@ -62,10 +62,17 @@ pub async fn proxy(
     let ua_preview = headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or("").chars().take(40).collect::<String>();
     eprintln!("[sub-injector] >> GET {} ua={ua_preview:?}", path_preview(uri.path()));
 
+    // `connection` is hop-by-hop. `accept-encoding` belongs to reqwest: it advertises the
+    // compressions it can actually decode, while a client's list may name one it cannot (zstd,
+    // say). Forwarded, that list makes the panel answer in a compression the injector cannot
+    // read, and the body reaches `decode_sub_body` still encoded — where it reads as "not a
+    // subscription" and injection silently does nothing.
+    const SKIP_REQUEST: &[&str] = &["connection", "accept-encoding"];
+
     let mut req = cfg.client.get(&upstream_url);
 
     for (name, value) in &headers {
-        if name.as_str().to_lowercase() == "connection" {
+        if SKIP_REQUEST.contains(&name.as_str().to_lowercase().as_str()) {
             continue;
         }
         req = req.header(name.as_str(), value.to_str().unwrap_or(""));

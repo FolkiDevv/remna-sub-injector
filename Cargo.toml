@@ -22,6 +22,8 @@ toml = "0.8"
 
 [dev-dependencies]
 tower = "0.5"
+# Only to build a gzipped body in the test that covers a compressing upstream.
+flate2 = "1"
 
 [profile.release]
 opt-level = "z"

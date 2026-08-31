@@ -1,10 +1,13 @@
 //! The TOML config file and its defaults.
 
-use std::{fs, time::Duration};
+use std::{collections::HashMap, fs, time::Duration};
 
 use serde::{Deserialize, Deserializer};
 
-use crate::subscription::is_proxy_uri;
+use crate::{
+    source_headers::{is_reserved, MAX_HWID_LEN},
+    subscription::is_proxy_uri,
+};
 
 /// Used when a source does not announce a refresh interval of its own.
 pub const DEFAULT_CACHE_TTL_SECS: u64 = 300;
@@ -21,6 +24,10 @@ pub struct FileConfig {
     pub cache_max_stale: u64,
     #[serde(default = "default_respect_headers")]
     pub cache_respect_headers: bool,
+    /// Overrides for the headers sent when a links source is fetched over HTTP. Absent means the
+    /// Happ-shaped defaults; an empty value drops that header. See [`crate::source_headers`].
+    #[serde(default)]
+    pub source_headers: HashMap<String, String>,
     pub injections: Vec<InjectionRule>,
 }
 
@@ -76,11 +83,32 @@ pub fn load_config(path: &str) -> FileConfig {
         .unwrap_or_else(|e| panic!("Invalid config file {path}: {e}"));
     validate(&config)
         .unwrap_or_else(|e| panic!("Invalid config file {path}: {e}"));
+    if let Some(hwid) = config.source_headers.iter().find(|(name, _)| name.eq_ignore_ascii_case("x-hwid")) {
+        if hwid.1.len() > MAX_HWID_LEN {
+            eprintln!(
+                "[sub-injector] warning: source_headers x-hwid is {} characters; panels usually reject anything over {MAX_HWID_LEN}",
+                hwid.1.len()
+            );
+        }
+    }
     config
 }
 
 /// Catches at startup what would otherwise only show up as a rule that silently injects nothing.
 fn validate(config: &FileConfig) -> Result<(), String> {
+    for (name, value) in &config.source_headers {
+        if reqwest::header::HeaderName::try_from(name.as_str()).is_err() {
+            return Err(format!("source_headers: {name:?} is not a valid header name"));
+        }
+        if reqwest::header::HeaderValue::try_from(value.as_str()).is_err() {
+            return Err(format!("source_headers ({name}): the value is not valid for a header"));
+        }
+        // Set here they would either be overwritten by the fetch itself or break it outright.
+        if is_reserved(name) {
+            return Err(format!("source_headers: {name} is set by the injector and cannot be configured"));
+        }
+    }
+
     for (i, rule) in config.injections.iter().enumerate() {
         if rule.links_source.is_empty() {
             return Err(format!("injections[{i}] ({}): links_source is empty", rule.header));
@@ -198,6 +226,72 @@ upstream_url = "http://upstream:2096"
 header = "User-Agent"
 contains = ["hiddify"]
 links_source = []
+"#;
+        load_config(&write_temp_file(toml_content));
+    }
+
+    #[test]
+    fn source_headers_are_read_from_the_file() {
+        let toml_content = r#"
+upstream_url = "http://upstream:2096"
+
+[source_headers]
+user-agent = "Happ/9.9.9"
+x-hwid = ""
+
+[[injections]]
+header = "User-Agent"
+contains = ["hiddify"]
+links_source = "/data/hy2.txt"
+"#;
+        let cfg = load_config(&write_temp_file(toml_content));
+        assert_eq!(cfg.source_headers.get("user-agent"), Some(&"Happ/9.9.9".to_string()));
+        assert_eq!(cfg.source_headers.get("x-hwid"), Some(&String::new()));
+    }
+
+    #[test]
+    fn source_headers_default_to_empty() {
+        let toml_content = r#"
+upstream_url = "http://upstream:2096"
+
+[[injections]]
+header = "User-Agent"
+contains = ["hiddify"]
+links_source = "/data/hy2.txt"
+"#;
+        assert!(load_config(&write_temp_file(toml_content)).source_headers.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot be configured")]
+    fn a_reserved_source_header_is_rejected() {
+        let toml_content = r#"
+upstream_url = "http://upstream:2096"
+
+[source_headers]
+Accept-Encoding = "gzip"
+
+[[injections]]
+header = "User-Agent"
+contains = ["hiddify"]
+links_source = "/data/hy2.txt"
+"#;
+        load_config(&write_temp_file(toml_content));
+    }
+
+    #[test]
+    #[should_panic(expected = "not a valid header name")]
+    fn a_malformed_source_header_name_is_rejected() {
+        let toml_content = r#"
+upstream_url = "http://upstream:2096"
+
+[source_headers]
+"user agent" = "Happ/1.0"
+
+[[injections]]
+header = "User-Agent"
+contains = ["hiddify"]
+links_source = "/data/hy2.txt"
 "#;
         load_config(&write_temp_file(toml_content));
     }

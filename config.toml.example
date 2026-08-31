@@ -12,6 +12,27 @@ cache_max_stale = 3600
 # Set to false to ignore what a source announces and always use cache_ttl.
 cache_respect_headers = true
 
+# Headers the injector puts on its own request when a links source is an
+# http(s):// URL. A source is usually another panel, and a panel answers by who
+# is asking: it picks the payload format from the User-Agent, and with a HWID
+# device limit enabled it wants x-hwid before it hands out a subscription.
+# These are the injector's headers, not the client's — nothing from the client
+# request is forwarded to a source.
+#
+# The whole table is optional. Without it the defaults below are used, with an
+# x-hwid derived from upstream_url (the same value on every restart, so the
+# source counts one steady device). Override any header here, or set it to ""
+# to drop it. NOTE: this is a plain table — it must come BEFORE the first
+# [[injections]] block, or TOML puts it inside that rule.
+#
+# [source_headers]
+# user-agent = "Happ/2.0.0 (com.happproxy; iOS 18.3.0)"
+# accept = "*/*"
+# x-device-os = "iOS"
+# x-ver-os = "18.3"
+# x-device-model = "iPhone"
+# x-hwid = "3f2b1c8a-..."   # up to 36 characters
+
 # Each [[injections]] block defines one rule.
 # The proxy checks request headers against each rule in order — first match wins.
 # links_source is one source or a list of them, merged in the order given.
