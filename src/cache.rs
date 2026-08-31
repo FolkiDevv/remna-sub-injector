@@ -47,6 +47,10 @@ enum Validator {
 
 struct Entry {
     links: Vec<String>,
+    /// The user-agent this answer came back for, when it was not the configured one. Remembered
+    /// so a source that needs a fallback client is asked as that client straight away on the
+    /// next refresh, instead of spending the failed attempts again every time.
+    user_agent: Option<String>,
     stored_at: Instant,
     /// How long `links` stays fresh. Zero for files, whose freshness is decided by the file's
     /// own mtime rather than by elapsed time.
@@ -168,6 +172,7 @@ impl LinksCache {
                         let links = parsed.links;
                         *entry = Some(Entry {
                             links: links.clone(),
+                            user_agent: None,
                             stored_at: Instant::now(),
                             ttl: Duration::ZERO,
                             validator: current,
@@ -195,38 +200,86 @@ impl LinksCache {
             }
         }
 
-        // The injector's own headers first, so the cache's validators below can never be
-        // displaced by whatever the config asks for.
-        let mut request = self.source_headers.apply(client.get(source));
-        if let Some(Entry { validator: Validator::Http { etag, last_modified }, .. }) = entry.as_ref() {
-            if let Some(etag) = etag {
-                request = request.header("if-none-match", etag);
+        let remembered = entry.as_ref().and_then(|cached| cached.user_agent.clone());
+        let mut first_format_error = None;
+        for user_agent in self.user_agents(remembered.as_deref()) {
+            // The injector's own headers first, so the cache's validators below can never be
+            // displaced by whatever the config asks for.
+            let mut request = self.source_headers.apply_as(client.get(source), user_agent.as_deref());
+            if let Some(Entry { validator: Validator::Http { etag, last_modified }, .. }) = entry.as_ref() {
+                if let Some(etag) = etag {
+                    request = request.header("if-none-match", etag);
+                }
+                if let Some(last_modified) = last_modified {
+                    request = request.header("if-modified-since", last_modified);
+                }
             }
-            if let Some(last_modified) = last_modified {
-                request = request.header("if-modified-since", last_modified);
+
+            match self.fetch(request).await {
+                Ok(Fetched::NotModified { ttl }) => {
+                    let cached = entry.as_mut().expect("304 only follows a conditional request");
+                    cached.stored_at = Instant::now();
+                    cached.ttl = ttl;
+                    return SourceOutcome::Fresh(cached.links.clone());
+                }
+                Ok(Fetched::Body { links, ttl, validator }) => {
+                    if let Some(user_agent) = user_agent.as_deref() {
+                        if remembered.as_deref() != Some(user_agent) {
+                            eprintln!(
+                                "[sub-injector] links source {label}: no link list for the default client, fetched as {user_agent} instead"
+                            );
+                        }
+                    }
+                    *entry = Some(Entry {
+                        links: links.clone(),
+                        user_agent,
+                        stored_at: Instant::now(),
+                        ttl,
+                        validator,
+                    });
+                    return SourceOutcome::Fresh(links);
+                }
+                // The source answered, but not with links. Another client may be served another
+                // format, so the remaining user-agents are worth a try before giving up. The
+                // first failure is the one worth reporting: it is what the configured client saw.
+                Err(FetchError::Format(e)) => {
+                    first_format_error.get_or_insert_with(|| e.to_string());
+                }
+                Err(FetchError::Other(e)) => {
+                    eprintln!("[sub-injector] links source {label} failed: {e}");
+                    return self.stale_or_failed(&label, entry);
+                }
             }
         }
 
-        match self.fetch(request).await {
-            Ok(Fetched::NotModified { ttl }) => {
-                let cached = entry.as_mut().expect("304 only follows a conditional request");
-                cached.stored_at = Instant::now();
-                cached.ttl = ttl;
-                SourceOutcome::Fresh(cached.links.clone())
-            }
-            Ok(Fetched::Body { links, ttl, validator }) => {
-                *entry = Some(Entry { links: links.clone(), stored_at: Instant::now(), ttl, validator });
-                SourceOutcome::Fresh(links)
-            }
-            Err(e) => {
-                eprintln!("[sub-injector] links source {label} failed: {e}");
-                self.stale_or_failed(&label, entry)
-            }
-        }
+        eprintln!(
+            "[sub-injector] links source {label} failed: {}",
+            first_format_error.unwrap_or_else(|| LinksError::NoValidUris.to_string())
+        );
+        self.stale_or_failed(&label, entry)
     }
 
-    async fn fetch(&self, request: reqwest::RequestBuilder) -> Result<Fetched, String> {
-        let response = request.send().await.map_err(|e| e.to_string())?;
+    /// The user-agents one refresh may try, in order: the one that last worked for this source,
+    /// then the configured default, then the format fallbacks. Each appears once.
+    ///
+    /// `None` stands for the configured user-agent, whatever it is — including none at all, when
+    /// the config dropped the header.
+    fn user_agents(&self, remembered: Option<&str>) -> Vec<Option<String>> {
+        let mut attempts: Vec<Option<String>> = vec![remembered.map(str::to_string)];
+        if remembered.is_some() {
+            attempts.push(None);
+        }
+        for fallback in self.source_headers.format_fallbacks() {
+            let fallback = Some((*fallback).to_string());
+            if !attempts.contains(&fallback) {
+                attempts.push(fallback);
+            }
+        }
+        attempts
+    }
+
+    async fn fetch(&self, request: reqwest::RequestBuilder) -> Result<Fetched, FetchError> {
+        let response = request.send().await.map_err(FetchError::other)?;
         let status = response.status();
         let headers = response.headers().clone();
         let ttl = self.ttl_policy.for_headers(&headers);
@@ -235,17 +288,17 @@ impl LinksCache {
             return Ok(Fetched::NotModified { ttl });
         }
         if !status.is_success() {
-            return Err(format!("HTTP {}", status.as_u16()));
+            return Err(FetchError::other(format!("HTTP {}", status.as_u16())));
         }
         if response.content_length().unwrap_or(0) > MAX_BODY_SIZE {
-            return Err("response too large".to_string());
+            return Err(FetchError::other("response too large"));
         }
-        let text = response.text().await.map_err(|e| e.to_string())?;
+        let text = response.text().await.map_err(FetchError::other)?;
         if text.len() as u64 > MAX_BODY_SIZE {
-            return Err("response too large".to_string());
+            return Err(FetchError::other("response too large"));
         }
 
-        let parsed = parse_links_payload(&text, SourceKind::Url).map_err(|e: LinksError| e.to_string())?;
+        let parsed = parse_links_payload(&text, SourceKind::Url).map_err(FetchError::Format)?;
         Ok(Fetched::Body {
             links: parsed.links,
             ttl,
@@ -280,6 +333,22 @@ impl LinksCache {
 enum Fetched {
     NotModified { ttl: Duration },
     Body { links: Vec<String>, ttl: Duration, validator: Validator },
+}
+
+/// Why a fetch produced no links — split by whether asking again, as a different client, could
+/// plausibly change the answer.
+enum FetchError {
+    /// The source answered with something other than a link list.
+    Format(LinksError),
+    /// The request itself did not get that far: a timeout, a DNS failure, an HTTP error, a body
+    /// too large to read. Another user-agent would only repeat it.
+    Other(String),
+}
+
+impl FetchError {
+    fn other(e: impl ToString) -> Self {
+        Self::Other(e.to_string())
+    }
 }
 
 fn header_owned(headers: &reqwest::header::HeaderMap, name: &str) -> Option<String> {

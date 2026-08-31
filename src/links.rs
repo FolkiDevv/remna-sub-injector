@@ -32,6 +32,9 @@ pub enum LinksError {
     /// Nothing in the payload looked like a proxy URI, base64 included — an HTML error page,
     /// a captive portal, an empty file.
     NoValidUris,
+    /// The payload is a ready-made client profile, not a list of links. A panel picks the format
+    /// from the `User-Agent`, so this is a diagnosis with a fix: ask as a different client.
+    ClientProfile { format: &'static str },
     /// The source is a subscription whose own account is disabled, expired or out of traffic.
     ServiceMessage,
     /// Some lines are not proxy URIs. Only reported for remote sources.
@@ -42,6 +45,11 @@ impl fmt::Display for LinksError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NoValidUris => write!(f, "no proxy links in the response"),
+            Self::ClientProfile { format } => write!(
+                f,
+                "the source answered with {format}, not a list of proxy links \
+                 (a panel picks the format from the User-Agent it is asked with)"
+            ),
             Self::ServiceMessage => write!(f, "source is a service message, not a subscription"),
             Self::InvalidLines { count } => write!(f, "{count} line(s) are not proxy links"),
         }
@@ -66,13 +74,16 @@ pub struct ParsedLinks {
 /// that is not a proxy URI means the response is corrupt (a truncated body, an error page) and the
 /// whole source is rejected.
 pub fn parse_links_payload(raw: &str, kind: SourceKind) -> Result<ParsedLinks, LinksError> {
+    let unreadable = || client_profile_format(raw)
+        .map_or(LinksError::NoValidUris, |format| LinksError::ClientProfile { format });
+
     let (links, skipped) = match split_uris(raw) {
         // Nothing readable as-is — the payload is probably a base64 subscription.
         (links, _) if links.is_empty() => {
-            let decoded = decode_sub_body(raw.as_bytes()).ok_or(LinksError::NoValidUris)?;
+            let decoded = decode_sub_body(raw.as_bytes()).ok_or_else(unreadable)?;
             let (links, skipped) = split_uris(&decoded);
             if links.is_empty() {
-                return Err(LinksError::NoValidUris);
+                return Err(unreadable());
             }
             (links, skipped)
         }
@@ -86,6 +97,30 @@ pub fn parse_links_payload(raw: &str, kind: SourceKind) -> Result<ParsedLinks, L
         return Err(LinksError::InvalidLines { count: skipped });
     }
     Ok(ParsedLinks { links, skipped })
+}
+
+/// Names the client profile a payload turned out to be, if it is one.
+///
+/// Only reached once a payload has already failed to yield a single proxy URI, so it does not
+/// have to be a parser — it has to tell the operator which format a source served, since that
+/// is what decides which `User-Agent` gets a link list out of it.
+fn client_profile_format(raw: &str) -> Option<&'static str> {
+    let trimmed = raw.trim_start();
+    let head = trimmed.get(..trimmed.len().min(4096)).unwrap_or(trimmed);
+    match trimmed.as_bytes().first()? {
+        // Xray and sing-box profiles are both JSON: an array of configs, or one config object.
+        b'[' | b'{' => Some("a JSON client profile (Xray or sing-box)"),
+        b'<' => Some("an HTML page"),
+        _ => head
+            .lines()
+            .any(|line| {
+                matches!(
+                    line.split(':').next().map(str::trim),
+                    Some("proxies" | "proxy-groups" | "mixed-port" | "socks-port" | "port")
+                ) && line.contains(':')
+            })
+            .then_some("a Clash/Mihomo YAML profile"),
+    }
 }
 
 fn split_uris(text: &str) -> (Vec<String>, usize) {
@@ -253,8 +288,44 @@ mod tests {
     #[test]
     fn html_error_page_is_rejected() {
         let page = "<!DOCTYPE html>\n<html><body>502 Bad Gateway</body></html>";
-        assert_eq!(parse_links_payload(page, SourceKind::Url), Err(LinksError::NoValidUris));
-        assert_eq!(parse_links_payload(page, SourceKind::File), Err(LinksError::NoValidUris));
+        let expected = Err(LinksError::ClientProfile { format: "an HTML page" });
+        assert_eq!(parse_links_payload(page, SourceKind::Url), expected);
+        assert_eq!(parse_links_payload(page, SourceKind::File), expected);
+    }
+
+    #[test]
+    fn a_client_profile_is_reported_as_one() {
+        // What a panel answers a Happ or Streisand user-agent with: an array of Xray configs,
+        // with not a proxy URI in sight. The shape of the real body from the report.
+        let xray_json = "[{\"remarks\":\"Auto\",\"log\":{\"loglevel\":\"warning\"},\"outbounds\":[{\"protocol\":\"vless\"}]}]";
+        assert_eq!(
+            parse_links_payload(xray_json, SourceKind::Url),
+            Err(LinksError::ClientProfile { format: "a JSON client profile (Xray or sing-box)" })
+        );
+        // A single sing-box config object rather than an array.
+        let singbox = "{\n  \"outbounds\": [ { \"type\": \"vless\" } ]\n}";
+        assert!(matches!(
+            parse_links_payload(singbox, SourceKind::Url),
+            Err(LinksError::ClientProfile { .. })
+        ));
+        let clash = "mixed-port: 7890\nallow-lan: false\nproxies:\n  - name: node\n    type: vless\n";
+        assert_eq!(
+            parse_links_payload(clash, SourceKind::Url),
+            Err(LinksError::ClientProfile { format: "a Clash/Mihomo YAML profile" })
+        );
+    }
+
+    #[test]
+    fn a_profile_error_says_what_to_do_about_it() {
+        let message = LinksError::ClientProfile { format: "a JSON client profile (Xray or sing-box)" }.to_string();
+        assert!(message.contains("JSON client profile"), "{message}");
+        assert!(message.contains("User-Agent"), "the operator needs the cause, not just the symptom: {message}");
+    }
+
+    #[test]
+    fn plain_junk_is_still_just_no_links() {
+        // Not a profile, just unreadable — the old message stays for it.
+        assert_eq!(parse_links_payload("hello there", SourceKind::Url), Err(LinksError::NoValidUris));
     }
 
     #[test]

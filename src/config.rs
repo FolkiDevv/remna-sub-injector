@@ -25,7 +25,8 @@ pub struct FileConfig {
     #[serde(default = "default_respect_headers")]
     pub cache_respect_headers: bool,
     /// Overrides for the headers sent when a links source is fetched over HTTP. Absent means the
-    /// Happ-shaped defaults; an empty value drops that header. See [`crate::source_headers`].
+    /// defaults; an empty value drops that header. Setting `user-agent` here also turns off the
+    /// format fallback — see [`crate::source_headers`].
     #[serde(default)]
     pub source_headers: HashMap<String, String>,
     pub injections: Vec<InjectionRule>,

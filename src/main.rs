@@ -20,8 +20,9 @@ async fn main() {
         .build()
         .expect("Failed to build HTTP client");
 
-    // A source is usually another panel, and a panel answers by who is asking — so the injector
-    // asks as one steady Happ client. The hwid is derived from the upstream URL, which keeps it
+    // A source is usually another panel, and a panel answers by who is asking: the format it
+    // serves is chosen by the User-Agent, so the injector asks as one steady client that panels
+    // answer with a plain link list. The hwid is derived from the upstream URL, which keeps it
     // the same across restarts instead of claiming a new device on every one.
     let source_headers = SourceHeaders::from_config(&file_cfg.upstream_url, &file_cfg.source_headers);
     let links_cache = LinksCache::new(
