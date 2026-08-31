@@ -152,6 +152,8 @@ struct MockState {
     headers: Vec<(String, String)>,
     /// When set, a conditional request carrying this validator is answered with 304.
     etag: Option<String>,
+    /// The headers of the last request that reached the source.
+    seen: Vec<(String, String)>,
 }
 
 impl MockSource {
@@ -161,6 +163,7 @@ impl MockSource {
             status: 200,
             headers: Vec::new(),
             etag: None,
+            seen: Vec::new(),
         }));
         let hits = Arc::new(AtomicUsize::new(0));
 
@@ -176,7 +179,16 @@ impl MockSource {
                     let hits = handler_hits.clone();
                     async move {
                         hits.fetch_add(1, Ordering::SeqCst);
-                        let state = state.lock().unwrap().clone();
+                        let state = {
+                            let mut state = state.lock().unwrap();
+                            state.seen = headers
+                                .iter()
+                                .map(|(name, value)| {
+                                    (name.as_str().to_string(), value.to_str().unwrap_or("").to_string())
+                                })
+                                .collect();
+                            state.clone()
+                        };
                         let if_none_match = headers.get("if-none-match").and_then(|v| v.to_str().ok());
                         if let (Some(etag), Some(sent)) = (state.etag.as_deref(), if_none_match) {
                             if etag == sent {
@@ -224,6 +236,12 @@ impl MockSource {
 
     pub fn set_etag(&self, etag: &str) {
         self.state.lock().unwrap().etag = Some(etag.to_string());
+    }
+
+    /// The value the last request carried under `name`, if any.
+    pub fn seen_header(&self, name: &str) -> Option<String> {
+        let state = self.state.lock().unwrap();
+        state.seen.iter().find(|(seen, _)| seen == name).map(|(_, value)| value.clone())
     }
 }
 
