@@ -205,7 +205,7 @@ The injector reads a TOML config file. By default it looks for `config.toml` in 
 | `cache_ttl` | integer | no | `300` | Seconds a links source may be reused when it does not announce an interval of its own |
 | `cache_max_stale` | integer | no | `3600` | Seconds a source may keep serving its last good answer after a failed refresh |
 | `cache_respect_headers` | bool | no | `true` | `false` ignores what a source announces and always uses `cache_ttl` |
-| `source_headers` | table | no | Happ defaults | Headers the injector sends when it fetches a links source over HTTP (see [Fetching a links source](#fetching-a-links-source)) |
+| `source_headers` | table | no | see below | Headers the injector sends when it fetches a links source over HTTP; setting `user-agent` also turns off the format retry (see [Fetching a links source](#fetching-a-links-source)) |
 | `injections` | array | yes | — | List of injection rules (see below) |
 
 Each `[[injections]]` rule:
@@ -264,7 +264,9 @@ as a source directly, and its nodes are merged into the response.
 
 Everything a source returns is checked to be a list of proxy URIs (`scheme://…`) before any of it
 reaches a client, which keeps an HTML error page, a captive portal or a truncated body out of the
-subscription. What happens to a source that is only partly readable depends on where it came from:
+subscription. A payload that is a client profile rather than a list is named as one in the log —
+that failure has a cause worth knowing about, and it is handled by
+[asking the source as a different client](#fetching-a-links-source). What happens to a source that is only partly readable depends on where it came from:
 
 - **A local file** is hand-written, so an unreadable line is treated as a typo: that line is
   dropped, a warning naming the count goes to the log, and the remaining nodes are injected.
@@ -314,19 +316,33 @@ down meant the client simply got a subscription without your extra nodes.
 ## Fetching a links source
 
 A links source that is an `http(s)://` URL is usually another subscription panel, and a panel
-answers by who is asking: it picks the payload format from the `User-Agent`, and with a
+answers by who is asking: it picks the payload **format** from the `User-Agent`, and with a
 [HWID device limit](https://docs.rw/docs/features/hwid-device-limit/) enabled it wants `x-hwid`
-before it hands out a subscription at all. So the injector fetches a source as a Happ client
-would:
+before it hands out a subscription at all.
+
+The format is what decides whether a source is usable at all. This injector appends proxy links
+to a list of proxy links, so a source has to answer with a list of them — plain or base64. Ask
+the same panel as a Happ, Streisand or sing-box client and it answers with a ready-made client
+profile instead (Xray JSON, Clash YAML): no links to append, and formats that quietly leave out
+whatever they cannot express — hysteria2 entries, for one. The subscription standard has no
+`Accept` header to ask for a format, so the injector introduces itself as a client that panels
+answer with a plain list:
 
 | Header | Default |
 |---|---|
-| `user-agent` | `Happ/2.0.0 (com.happproxy; iOS 18.3.0)` |
+| `user-agent` | `v2rayNG/1.10.5` |
 | `accept` | `*/*` |
 | `x-hwid` | derived from `upstream_url`, in the shape of a UUID |
-| `x-device-os` | `iOS` |
-| `x-ver-os` | `18.3` |
-| `x-device-model` | `iPhone` |
+| `x-device-os` | `Android` |
+| `x-ver-os` | `14` |
+| `x-device-model` | `Pixel 7` |
+
+If a source answers that with a client profile anyway — the mapping from user-agent to format is
+the source panel's to configure — the fetch is repeated as `Hiddify`, then `v2rayN`, then `SFI`,
+and the first answer that is a link list wins. The client that worked is remembered per source,
+so the next refresh asks as that one straight away instead of failing its way there again. The
+retry only happens after a real answer that could not be read: a timeout, an HTTP error or an
+oversized body is reported as-is, since another user-agent would only repeat it.
 
 These are the **injector's** headers, not the client's. Nothing from the request that triggered
 the fetch is forwarded to a source — not its `User-Agent`, not its `x-hwid`, and not its cookies
@@ -338,13 +354,25 @@ restarts and upgrades: a source with a device limit counts this injector as one 
 one after every deploy.
 
 Override any of it with a `[source_headers]` table — for example to paste the exact `User-Agent`
-of your own Happ build, or your own device id. An empty value drops the header entirely:
+of your own client build, or your own device id. An empty value drops the header entirely:
 
 ```toml
 [source_headers]
 user-agent = "Happ/2.5.0 (com.happproxy; iOS 18.3.0)"
 x-device-model = ""
 ```
+
+Setting `user-agent` here also turns the format retry off: naming the client to imitate is a
+deliberate choice, and asking as something else behind your back would undo it. If the log then
+says
+
+```
+links source https://panel.example.com/... failed: the source answered with a JSON client
+profile (Xray or sing-box), not a list of proxy links
+```
+
+that is the panel serving your chosen client a profile — pick a user-agent it answers with a
+link list, or drop the override and let the defaults handle it.
 
 Being a plain TOML table, `[source_headers]` has to come **before** the first `[[injections]]`
 block, otherwise TOML nests it inside that rule. Headers the injector manages itself are rejected

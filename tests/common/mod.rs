@@ -222,6 +222,10 @@ pub struct MockSource {
 #[derive(Clone)]
 struct MockState {
     body: String,
+    /// `(user-agent substring, body)`: a panel serves the format it thinks the asking client
+    /// wants, so a mock source can too. The first match wins; `body` is the answer to everyone
+    /// else.
+    by_user_agent: Vec<(String, String)>,
     status: u16,
     headers: Vec<(String, String)>,
     /// When set, a conditional request carrying this validator is answered with 304.
@@ -234,6 +238,7 @@ impl MockSource {
     pub async fn start(body: &str) -> Self {
         let state = Arc::new(Mutex::new(MockState {
             body: body.to_string(),
+            by_user_agent: Vec::new(),
             status: 200,
             headers: Vec::new(),
             etag: None,
@@ -272,6 +277,13 @@ impl MockSource {
                                     .unwrap();
                             }
                         }
+                        let user_agent =
+                            headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or("");
+                        let body = state
+                            .by_user_agent
+                            .iter()
+                            .find(|(needle, _)| user_agent.to_lowercase().contains(&needle.to_lowercase()))
+                            .map_or(state.body.clone(), |(_, body)| body.clone());
                         let mut builder = Response::builder()
                             .status(state.status)
                             .header("content-type", "text/plain");
@@ -281,7 +293,7 @@ impl MockSource {
                         for (name, value) in &state.headers {
                             builder = builder.header(name, value);
                         }
-                        builder.body(axum::body::Body::from(state.body.clone())).unwrap()
+                        builder.body(axum::body::Body::from(body)).unwrap()
                     }
                 }),
             );
@@ -294,6 +306,16 @@ impl MockSource {
 
     pub fn hits(&self) -> usize {
         self.hits.load(Ordering::SeqCst)
+    }
+
+    /// Answer `body` to a client whose user-agent contains `needle`, the way a panel keyed to a
+    /// client family does.
+    pub fn answer_client(&self, needle: &str, body: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .by_user_agent
+            .push((needle.to_string(), body.to_string()));
     }
 
     pub fn set_body(&self, body: &str) {

@@ -1,11 +1,19 @@
 //! The headers the injector puts on its own request when a links source is an http(s) URL.
 //!
 //! A source is usually another subscription panel, and a panel answers a request by who is
-//! asking: it picks the payload format from the `User-Agent`, and with a HWID device limit
+//! asking: it picks the payload *format* from the `User-Agent`, and with a HWID device limit
 //! enabled it wants `x-hwid` (plus the optional `x-device-os` / `x-ver-os` / `x-device-model`)
 //! before it hands out a subscription at all. Fetched without any of that — which is what
 //! `reqwest` sends by default, not even a `User-Agent` — a source can answer with the wrong
 //! format or refuse outright.
+//!
+//! The format is the part that decides whether a source is usable at all. The injector appends
+//! proxy URIs to a list of proxy URIs, so a source has to answer with a list of them — plain or
+//! base64. A panel that thinks it is talking to a Happ, Streisand or sing-box client answers
+//! with a ready-made client profile instead (Xray JSON, Clash YAML), and there is no `Accept`
+//! header in the subscription standard to ask for something else. So the injector introduces
+//! itself as the kind of client every panel answers with a plain list, and if a source still
+//! sends a profile, [`FORMAT_FALLBACK_USER_AGENTS`] gives the fetch a second and third try.
 //!
 //! The headers are the injector's own, not the client's: nothing from the request that triggered
 //! the fetch is forwarded here. That keeps one answer per source (the cache stays keyed on the
@@ -13,14 +21,30 @@
 
 use std::collections::HashMap;
 
-/// The set a source sees by default: one Happ client, on one device.
+/// The set a source sees by default: one plain-list client, on one device.
+///
+/// The `user-agent` is a v2rayNG one because that is the client panels answer with a plain link
+/// list — Remnawave, Marzban and Hiddify all map it to the base64/plain subscription. A Happ,
+/// Streisand or sing-box user-agent gets a JSON profile instead, which carries no links to
+/// append to and silently drops whatever the profile format cannot express (hysteria2 entries,
+/// for one). Change this only for something that is also answered with a link list.
 const DEFAULTS: &[(&str, &str)] = &[
-    ("user-agent", "Happ/2.0.0 (com.happproxy; iOS 18.3.0)"),
+    ("user-agent", "v2rayNG/1.10.5"),
     ("accept", "*/*"),
-    ("x-device-os", "iOS"),
-    ("x-ver-os", "18.3"),
-    ("x-device-model", "iPhone"),
+    ("x-device-os", "Android"),
+    ("x-ver-os", "14"),
+    ("x-device-model", "Pixel 7"),
 ];
+
+/// Tried in order when a source's answer turns out not to be a link list.
+///
+/// A panel picks the format from the `User-Agent` and its mapping is the operator's to
+/// configure, so no single user-agent is right everywhere. These are clients from different
+/// families, so a panel that serves the default one a profile is likely to serve one of these
+/// a list. Only used after a real answer that could not be read — never on a network error, an
+/// HTTP error, or a source whose user-agent the config pins.
+pub const FORMAT_FALLBACK_USER_AGENTS: &[&str] =
+    &["Hiddify/2.5.7", "v2rayN/7.0.1", "SFI/1.11.0"];
 
 /// Remnawave documents `x-hwid` as at most this long.
 pub const MAX_HWID_LEN: usize = 36;
@@ -47,23 +71,26 @@ pub fn is_reserved(name: &str) -> bool {
 pub struct SourceHeaders {
     /// Names are lowercase, and the order is stable so a log reads the same on every start.
     headers: Vec<(String, String)>,
+    /// The config set (or dropped) `user-agent` itself, so the format fallback stays out of it.
+    user_agent_pinned: bool,
 }
 
 impl SourceHeaders {
-    /// The Happ-shaped defaults, with an `x-hwid` derived from `seed`.
-    pub fn happ_defaults(seed: &str) -> Self {
+    /// The defaults, with an `x-hwid` derived from `seed`.
+    pub fn defaults(seed: &str) -> Self {
         let mut headers: Vec<(String, String)> = DEFAULTS
             .iter()
             .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
             .collect();
         headers.push(("x-hwid".to_string(), derive_hwid(seed)));
-        Self { headers }
+        Self { headers, user_agent_pinned: false }
     }
 
     /// The defaults with the config's `[source_headers]` applied on top: a known name is
     /// replaced, an unknown one is appended, and an empty value drops the header entirely.
     pub fn from_config(seed: &str, overrides: &HashMap<String, String>) -> Self {
-        let mut headers = Self::happ_defaults(seed).headers;
+        let mut headers = Self::defaults(seed).headers;
+        let user_agent_pinned = overrides.keys().any(|name| name.eq_ignore_ascii_case("user-agent"));
 
         // Sorted so the resulting order — and the startup log — does not depend on the hash map.
         let mut pairs: Vec<(String, &String)> = overrides
@@ -84,7 +111,7 @@ impl SourceHeaders {
             }
         }
 
-        Self { headers }
+        Self { headers, user_agent_pinned }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -97,10 +124,40 @@ impl SourceHeaders {
         self.headers.iter().map(|(name, _)| name.as_str()).collect()
     }
 
+    /// The user-agents a source may be retried with when its answer is not a link list, most
+    /// promising first. Empty when the config pinned a user-agent: an operator who named the
+    /// client to imitate did so because that source needs it, and quietly asking as something
+    /// else would undo the setting.
+    pub fn format_fallbacks(&self) -> &'static [&'static str] {
+        if self.user_agent_pinned {
+            &[]
+        } else {
+            FORMAT_FALLBACK_USER_AGENTS
+        }
+    }
+
     pub fn apply(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        self.headers
-            .iter()
-            .fold(request, |request, (name, value)| request.header(name.as_str(), value.as_str()))
+        self.apply_as(request, None)
+    }
+
+    /// The headers, with `user_agent` in place of the configured one — the retry of a source
+    /// that answered the default client with a client profile instead of a link list.
+    pub fn apply_as(
+        &self,
+        request: reqwest::RequestBuilder,
+        user_agent: Option<&str>,
+    ) -> reqwest::RequestBuilder {
+        let mut request = self.headers.iter().fold(request, |request, (name, value)| {
+            if name == "user-agent" && user_agent.is_some() {
+                request
+            } else {
+                request.header(name.as_str(), value.as_str())
+            }
+        });
+        if let Some(user_agent) = user_agent {
+            request = request.header("user-agent", user_agent);
+        }
+        request
     }
 }
 
@@ -135,11 +192,33 @@ mod tests {
     }
 
     #[test]
-    fn defaults_look_like_a_happ_client() {
-        let headers = SourceHeaders::happ_defaults("http://upstream:2096");
-        assert!(value(&headers, "user-agent").unwrap().to_lowercase().contains("happ"));
-        assert_eq!(value(&headers, "x-device-os"), Some("iOS"));
+    fn defaults_ask_as_a_client_that_is_served_a_link_list() {
+        let headers = SourceHeaders::defaults("http://upstream:2096");
+        let ua = value(&headers, "user-agent").unwrap().to_lowercase();
+        assert!(ua.contains("v2rayng"), "user-agent was {ua:?}");
+        // A panel answers these with a ready-made client profile, which carries no links to
+        // append to — whatever else this default becomes, it must not become one of them.
+        for profile_client in ["happ", "streisand", "sing-box", "clash", "stash"] {
+            assert!(!ua.contains(profile_client), "{profile_client} is served a profile, not links");
+        }
+        assert_eq!(value(&headers, "x-device-os"), Some("Android"));
         assert!(value(&headers, "x-hwid").is_some());
+    }
+
+    #[test]
+    fn format_fallbacks_are_offered_until_the_config_pins_a_user_agent() {
+        let defaults = SourceHeaders::defaults("seed");
+        assert_eq!(defaults.format_fallbacks(), FORMAT_FALLBACK_USER_AGENTS);
+        assert!(!defaults.format_fallbacks().is_empty(), "a wrong-format answer must be retryable");
+
+        let pinned = SourceHeaders::from_config("seed", &overrides(&[("User-Agent", "Happ/9.9.9")]));
+        assert!(pinned.format_fallbacks().is_empty(), "a pinned user-agent is the operator's call");
+        // Dropping the header is a decision too.
+        let dropped = SourceHeaders::from_config("seed", &overrides(&[("user-agent", "")]));
+        assert!(dropped.format_fallbacks().is_empty());
+        // An unrelated override leaves the fallbacks in place.
+        let other = SourceHeaders::from_config("seed", &overrides(&[("x-hwid", "ID")]));
+        assert_eq!(other.format_fallbacks(), FORMAT_FALLBACK_USER_AGENTS);
     }
 
     #[test]
@@ -175,6 +254,22 @@ mod tests {
         let headers = SourceHeaders::from_config("seed", &overrides(&[("x-hwid", "")]));
         assert_eq!(value(&headers, "x-hwid"), None);
         assert!(value(&headers, "user-agent").is_some(), "the rest of the set survives");
+    }
+
+    #[test]
+    fn a_fallback_user_agent_replaces_the_default_without_duplicating_it() {
+        let headers = SourceHeaders::defaults("seed");
+        let request = reqwest::Client::new().get("http://source.invalid/links");
+        let request = headers.apply_as(request, Some("Hiddify/2.5.7")).build().unwrap();
+
+        let sent: Vec<&str> = request
+            .headers()
+            .get_all("user-agent")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(sent, vec!["Hiddify/2.5.7"], "one user-agent, the retry's");
+        assert!(request.headers().get("x-hwid").is_some(), "the rest of the set is unchanged");
     }
 
     #[test]
